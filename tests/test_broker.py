@@ -382,6 +382,99 @@ async def test_dead_downstream_gives_clear_error(store: ConfigStore) -> None:
         assert entry["last_error"]
 
 
+# -- capability_consider (planning-phase advice) ---------------------------------
+
+
+def _fake_search_factory(calls: list[str], entries=None, error: Exception | None = None):
+    async def fake_search(query: str, limit: int = 5):
+        calls.append(query)
+        if error is not None:
+            raise error
+        return entries if entries is not None else parse_server_list(MOCK_REGISTRY_PAYLOAD)
+
+    return fake_search
+
+
+@pytest.mark.anyio
+async def test_consider_advice_cache_and_trust(store: ConfigStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    from extrovert import broker as broker_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(broker_mod, "search_servers", _fake_search_factory(calls))
+    store.record_trust(
+        "remote-filesystem",
+        {
+            "verified_at": "2026-01-01T00:00:00+00:00",
+            "passed": True,
+            "evidence": "test",
+            "tools": [],
+            "source": "registry",
+            "identifier": "com.pulsemcp/remote-filesystem",
+        },
+    )
+
+    server = build_server(store)
+    async with Broker(server, store) as broker:
+        first = await broker.consider("sync files to cloud storage")
+        assert first["ok"] and first["registry_reachable"] is True
+        assert "cached" not in first
+        top = first["candidates"][0]
+        assert top["name"] == "com.pulsemcp/remote-filesystem"
+        assert top["verified_locally"] is True
+        assert top["verified_at"] == "2026-01-01T00:00:00+00:00"
+        assert first["skipped_remote_only"] == 1  # the remote-only entry is filtered out
+        assert "可考虑外部能力" in first["advice"]
+
+        # same task (case-insensitive) hits the cache, no second registry call
+        second = await broker.consider("Sync files to cloud storage")
+        assert second["cached"] is True
+        assert len(calls) == 1
+
+        # expiry: TTL 0 forces a fresh call
+        monkeypatch.setattr(broker_mod, "CONSIDER_CACHE_TTL_SECONDS", 0)
+        third = await broker.consider("sync files to cloud storage")
+        assert "cached" not in third
+        assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_consider_degrades_when_registry_down(
+    store: ConfigStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from extrovert import broker as broker_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        broker_mod, "search_servers", _fake_search_factory(calls, error=RegistryError("boom"))
+    )
+
+    server = build_server(store)
+    async with Broker(server, store) as broker:
+        result = await broker.consider("render a 3d scene")
+        assert result["ok"] is True
+        assert result["registry_reachable"] is False
+        assert result["candidates"] == []
+        assert "boom" in result["reason"]
+        assert "自行实现" in result["advice"]
+        # failures are cached too: an outage must not stall planning on timeouts
+        again = await broker.consider("render a 3d scene")
+        assert again["cached"] is True
+        assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_consider_no_candidates(store: ConfigStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    from extrovert import broker as broker_mod
+
+    monkeypatch.setattr(broker_mod, "search_servers", _fake_search_factory([], entries=[]))
+    server = build_server(store)
+    async with Broker(server, store) as broker:
+        result = await broker.consider("highly project-specific business logic")
+        assert result["ok"] is True
+        assert result["candidates"] == []
+        assert "已确认无现成能力" in result["advice"]
+
+
 # -- full integration: real server process, real MCP client ------------------------
 
 
@@ -404,10 +497,11 @@ async def test_integration_full_flow(tmp_path: Path) -> None:
         async with ClientSession(read, write, message_handler=on_message) as session:
             await session.initialize()
 
-            # 1. only the five broker tools exist initially
+            # 1. only the six broker tools exist initially
             initial = {t.name for t in (await session.list_tools()).tools}
             assert initial == {
                 "capability_search",
+                "capability_consider",
                 "capability_add",
                 "capability_verify",
                 "capability_list",
@@ -421,6 +515,13 @@ async def test_integration_full_flow(tmp_path: Path) -> None:
             if searched["ok"]:
                 assert searched["count"] > 0
                 assert all("name" in r and "packages" in r for r in searched["results"])
+
+            # 2b. planning-phase advice (tolerate offline)
+            considered = result_payload(
+                await session.call_tool("capability_consider", {"task": "sync files to cloud storage"})
+            )
+            assert considered["ok"]
+            assert "advice" in considered and "candidates" in considered
 
             # 3. mount the local echo server
             added = result_payload(

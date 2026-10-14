@@ -14,6 +14,7 @@ import keyword
 import os
 import re
 import shlex
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ from .registry import (
 )
 
 MOUNT_TIMEOUT_SECONDS = float(os.environ.get("EXTROVERT_MOUNT_TIMEOUT", "90"))
+CONSIDER_CACHE_TTL_SECONDS = 600  # planning-phase cache for capability_consider
 MAX_TOOL_NAME_LENGTH = 128  # SEP-986 tool name limit
 PROBE_TOOL_PATTERN = re.compile(r"echo|ping|hello|version", re.IGNORECASE)
 REGISTRY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._-]+$")
@@ -161,6 +163,7 @@ class Broker:
         self.mounts: dict[str, Mount] = {}
         self._lock = anyio.Lock()
         self._tg: anyio.abc.TaskGroup | None = None
+        self._consider_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def __aenter__(self) -> "Broker":
         self._tg = anyio.create_task_group()
@@ -312,6 +315,86 @@ class Broker:
         except RegistryError:
             return []
         return [e.to_dict() for e in entries]
+
+    # -- planning-phase advice --------------------------------------------------
+
+    async def consider(self, task: str, limit: int = 5) -> dict[str, Any]:
+        """Planning-phase advice: which existing capabilities fit ``task``.
+
+        Unlike capability_search (a raw candidate list), this returns advisory
+        wording meant to be read while planning, annotates each candidate with
+        its local verification history from the trust store, and caches results
+        in memory for CONSIDER_CACHE_TTL_SECONDS so planning never hammers the
+        registry. Registry outages degrade to "implement it yourself" advice
+        with the reason attached.
+        """
+        key = task.strip().lower()
+        now = time.monotonic()
+        cached = self._consider_cache.get(key)
+        if cached and now - cached[0] < CONSIDER_CACHE_TTL_SECONDS:
+            return {**cached[1], "cached": True}
+
+        try:
+            entries = await search_servers(task, limit=limit)
+        except RegistryError as exc:
+            result: dict[str, Any] = {
+                "ok": True,
+                "task": task,
+                "registry_reachable": False,
+                "candidates": [],
+                "reason": str(exc),
+                "advice": "MCP Registry 暂不可达，该子任务先自行实现；网络恢复后可重新 capability_consider。",
+            }
+            self._consider_cache[key] = (now, result)
+            return result
+
+        trust = self.store.load_trust()
+        candidates: list[dict[str, Any]] = []
+        skipped = 0
+        for entry in entries:
+            if not entry.installable:
+                skipped += 1
+                continue
+            alias = sanitize_alias(entry.name.rsplit("/", 1)[-1])
+            record = trust.get(alias) or {}
+            verified = bool(record.get("passed"))
+            candidates.append(
+                {
+                    "name": entry.name,
+                    "description": entry.description,
+                    "version": entry.version,
+                    "source": "mcp-registry",
+                    "alias": alias,
+                    "verified_locally": verified,
+                    "verified_at": record.get("verified_at") if verified else None,
+                    "trust_hint": (
+                        f"本机已于 {record.get('verified_at')} 验证通过"
+                        if verified
+                        else "本机尚未验证过；安装后请 capability_verify"
+                    ),
+                }
+            )
+
+        if candidates:
+            top = candidates[0]
+            advice = (
+                f"该子任务可考虑外部能力：{top['name']}（{top['description'][:60]}）。"
+                f"安装前请告知用户将运行的命令，然后 capability_add({top['name']!r}) + capability_verify。"
+            )
+        else:
+            advice = "注册表中暂无合适的现成能力，请自行实现该子任务（已确认无现成能力）。"
+
+        result = {
+            "ok": True,
+            "task": task,
+            "registry_reachable": True,
+            "candidates": candidates,
+            "skipped_remote_only": skipped,
+            "advice": advice,
+            "note": "capability_verify 是活性检查而非安全审计；只安装你信任的发布者",
+        }
+        self._consider_cache[key] = (now, result)
+        return result
 
     async def _spawn(self, alias: str, argv: list[str], *, source: str, identifier: str) -> Mount:
         if self._tg is None:

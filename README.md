@@ -2,7 +2,9 @@
 
 让"内向"的 AI agent 变外向：一个本地常驻的 MCP 能力代理（capability broker）。agent 只需配置一次 extrovert，之后就能自己检索[官方 MCP Registry](https://registry.modelcontextprotocol.io)、自动安装第三方 MCP 服务器、做冒烟验证，并把新工具**热挂载**进来——全程不需要用户介入，也不需要重启 agent。
 
-Make your "introverted" AI agent extroverted: a local MCP capability broker. Configure extrovert once, and the agent can search the [official MCP Registry](https://registry.modelcontextprotocol.io), install third-party MCP servers, smoke-verify them, and **hot-mount** their tools at runtime — no user intervention, no restarts.
+它的触发点不是用户口令，而是**任务规划阶段**：agent 拆解任务时，对每个属于通用外部能力的子任务（图/视频/音频生成、文档解析、爬取、SaaS API 等），先走 extrovert 流程找现成能力，而不是从零手搓。
+
+Make your "introverted" AI agent extroverted: a local MCP capability broker. Configure extrovert once, and the agent can search the [official MCP Registry](https://registry.modelcontextprotocol.io), install third-party MCP servers, smoke-verify them, and **hot-mount** their tools at runtime — no user intervention, no restarts. The trigger is the agent's task-planning phase, not a user password: while decomposing a task, the agent checks each generic-capability subtask against extrovert before building anything from scratch.
 
 ## 30 秒安装 / 30-second install
 
@@ -34,6 +36,16 @@ No manual config editing: paste the magic prompt from [INSTALL.md](INSTALL.md) i
 3. **验证 Verify** — `capability_verify(alias)` 冒烟检查：ping + list_tools，若存在无参数的 echo/ping/hello/version 类安全工具则真实调用一次，证据写入信任库 `~/.extrovert/trust.json`。/ smoke check: ping + list_tools + one safe zero-argument probe call; evidence goes to the trust store.
 4. **挂载 Mount** — 下游工具以 `<alias>__<tool>` 立即出现在工具列表中，并通过 `notifications/tools/list_changed` 通知客户端刷新；验证过的服务器会在下次启动时自动重挂载（`~/.extrovert/config.json`）。/ downstream tools appear immediately as `<alias>__<tool>`, the client is told via `notifications/tools/list_changed`, and verified servers auto-remount on next start.
 
+### 规划期自检 / Planning-phase check
+
+extrovert 的触发点是任务规划阶段，不是用户口令。agent 拆解任务后、动手之前：
+
+```
+任务 → 拆解 → 每个子任务问"这是通用能力吗" → capability_consider → 有则装验用，无则自己捏
+```
+
+`capability_consider(task)` 返回带本机验证状态的候选与建议措辞，结果有 10 分钟内存缓存；注册表不可达时优雅降级为"先自行实现"。自行实现的子任务应在总结里注明"已确认无现成能力"。这一行为由 `skills/extrovert/SKILL.md`（技能包）和 `extrovert hint`（hook 注入的一句话提醒）双重兜底。
+
 ## 安装 / Install
 
 ```bash
@@ -48,15 +60,16 @@ pip install -e .
 
 裸 `extrovert`（或 `extrovert serve`）运行 MCP 代理服务器；其余子命令用于安装与诊断：
 
-- `extrovert doctor` — 自检：Python/mcp SDK 版本、`npx`/`uvx` 可用性、注册表连通性（3s 超时）、`~/.extrovert` 可写性；关键项失败时退出码为 1
-- `extrovert install` — 检测本机客户端并注册 extrovert：有 `claude` CLI 就走 `claude mcp add -s user extrovert -- <启动命令>` 并用 `claude mcp list` 验证；Kimi Code 优先写 `~/.kimi-code/mcp.json` 的 `mcpServers`，或向已含 `[mcp_servers]` 段的 `config.toml` 追加条目（均先备份为 `.bak`）；格式不确定时**不猜**，打印片段让你手动粘贴。`--dry-run` 只看计划，`--yes` 跳过确认
-- `extrovert uninstall` — 反向移除
+- `extrovert doctor` — 自检：Python/mcp SDK 版本、`npx`/`uvx` 可用性、注册表连通性（3s 超时）、`extrovert hint` 可执行性、`~/.extrovert` 可写性；关键项失败时退出码为 1
+- `extrovert install` — 检测本机客户端并注册 extrovert：有 `claude` CLI 就走 `claude mcp add -s user extrovert -- <启动命令>` 并用 `claude mcp list` 验证；Kimi Code 优先写 `~/.kimi-code/mcp.json` 的 `mcpServers`，或向已含 `[mcp_servers]` 段的 `config.toml` 追加条目（均先备份为 `.bak`）；格式不确定时**不猜**，打印片段让你手动粘贴。`--dry-run` 只看计划，`--yes` 跳过确认；`--with-hook` 额外把 `extrovert hint` 写进 Claude Code 的 `~/.claude/settings.json`（UserPromptSubmit hook，备份且幂等）
+- `extrovert uninstall` — 反向移除（`--with-hook` 时一并摘除 hook）
+- `extrovert hint` — 打印一行规划期提醒，供客户端 hook 注入到用户消息上下文
 
 ### Skill 触发包 / Skill pack
 
-仓库自带 `skills/extrovert/SKILL.md`，让 agent 在听到"装个 XX 能力""找个 XX 工具"时可靠地走 search → add → verify → 调用流程（含失败必须如实报告等约束）。安装方式：软链或复制到 agent 的技能目录，例如 `ln -s $PWD/skills/extrovert ~/.agents/skills/extrovert`。
+仓库自带 `skills/extrovert/SKILL.md`，让 agent 在规划阶段自发对每个子任务做通用能力自检（`capability_consider`），并可靠地走 add → verify → 调用流程（含失败必须如实报告、反模式清单等约束）。安装方式：软链或复制到 agent 的技能目录，例如 `ln -s $PWD/skills/extrovert ~/.agents/skills/extrovert`。
 
-The repo ships `skills/extrovert/SKILL.md` so agents reliably route capability requests through extrovert. Symlink or copy it into your agent's skills directory, e.g. `~/.agents/skills/extrovert`.
+The repo ships `skills/extrovert/SKILL.md` so agents run a planning-phase capability check on every subtask and route through extrovert. Symlink or copy it into your agent's skills directory, e.g. `~/.agents/skills/extrovert`.
 
 ## 客户端配置 / Client configuration
 
@@ -94,6 +107,7 @@ claude mcp add -s user extrovert -- extrovert
 
 | 工具 | 作用 |
 |---|---|
+| `capability_consider(task, limit=5)` | 规划期建议：该子任务有无现成能力（含本机验证状态；10 分钟缓存；断网降级为"自行实现"） |
 | `capability_search(query, limit=5)` | 检索官方注册表；网络不可用时返回明确错误 |
 | `capability_add(identifier, alias=None)` | 安装并挂载（注册表名如 `com.example/foo`，或本地命令）；热挂载并发通知 |
 | `capability_verify(alias)` | ping + list_tools + 无参安全工具探针；结果写入信任库 |

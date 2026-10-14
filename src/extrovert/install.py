@@ -44,6 +44,11 @@ class LaunchCommand:
     def display(self) -> str:
         return " ".join(self.argv)
 
+    @property
+    def hint_command(self) -> str:
+        """Absolute command for prompt-submit hooks (PATH-independent)."""
+        return f"{self.display} hint"
+
     def to_json_entry(self) -> dict[str, Any]:
         entry: dict[str, Any] = {"command": self.argv[0]}
         if len(self.argv) > 1:
@@ -296,6 +301,108 @@ def uninstall_kimi_toml(target: ClientTarget, *, dry_run: bool) -> ActionResult:
     return ActionResult(target, True, True, f"removed {EXTROVERT_TOML_HEADER} block from {path}", planned)
 
 
+# -- claude UserPromptSubmit hook ------------------------------------------------
+
+
+def _hook_entry(command: str) -> dict[str, Any]:
+    return {"hooks": [{"type": "command", "command": command}]}
+
+
+def _hook_present(data: dict[str, Any], command: str) -> bool:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    entries = hooks.get("UserPromptSubmit")
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks") or []:
+            if isinstance(hook, dict) and hook.get("command") == command:
+                return True
+    return False
+
+
+def install_claude_hook(settings_path: Path, launch: LaunchCommand, *, dry_run: bool) -> ActionResult:
+    """Add a UserPromptSubmit hook running ``extrovert hint`` to Claude Code."""
+    target = ClientTarget("claude-hook", "Claude Code (UserPromptSubmit hook)", config_path=settings_path)
+    command = launch.hint_command
+    planned = [f"backup {settings_path}", f"add UserPromptSubmit hook '{command}' to {settings_path}"]
+    data: dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            parsed = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return ActionResult(
+                target,
+                False,
+                False,
+                f"cannot parse {settings_path} ({exc}); add the hook manually: {command}",
+                planned,
+            )
+        if not isinstance(parsed, dict):
+            return ActionResult(
+                target, False, False, f"{settings_path} is not a JSON object; not guessing", planned
+            )
+        data = parsed
+    if _hook_present(data, command):
+        return ActionResult(target, True, False, "hook already present", planned)
+    if dry_run:
+        return ActionResult(target, True, False, f"dry-run: would add hook '{command}'", planned)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings_path.exists():
+        backup_file(settings_path)
+    hooks = data.setdefault("hooks", {})
+    entries = hooks.setdefault("UserPromptSubmit", [])
+    entries.append(_hook_entry(command))
+    ConfigStore._save(settings_path, data)
+    return ActionResult(target, True, True, f"hook added to {settings_path} (backup: {settings_path}.bak)", planned)
+
+
+def uninstall_claude_hook(settings_path: Path, launch: LaunchCommand, *, dry_run: bool) -> ActionResult:
+    target = ClientTarget("claude-hook", "Claude Code (UserPromptSubmit hook)", config_path=settings_path)
+    command = launch.hint_command
+    planned = [f"backup {settings_path}", f"remove UserPromptSubmit hook '{command}' from {settings_path}"]
+    if not settings_path.exists():
+        return ActionResult(target, True, False, "no settings.json; nothing to remove", planned)
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return ActionResult(target, False, False, f"cannot parse {settings_path}: {exc}", planned)
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    entries = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    if not isinstance(entries, list) or not _hook_present(data, command):
+        return ActionResult(target, True, False, "hook not present", planned)
+    if dry_run:
+        return ActionResult(target, True, False, f"dry-run: would remove hook '{command}'", planned)
+    backup_file(settings_path)
+    entries[:] = [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and any(
+                isinstance(h, dict) and h.get("command") == command for h in entry.get("hooks") or []
+            )
+        )
+    ]
+    if not entries:
+        del hooks["UserPromptSubmit"]
+    if not hooks:
+        del data["hooks"]
+    ConfigStore._save(settings_path, data)
+    return ActionResult(target, True, True, f"hook removed from {settings_path}", planned)
+
+
+def kimi_hook_snippet(launch: LaunchCommand) -> str:
+    return (
+        "Kimi Code 的 hook 配置格式未确认，不擅自写入。\n"
+        "如果它支持“用户消息提交”类 hook，请自行接入以下命令：\n"
+        f"  {launch.hint_command}"
+    )
+
+
 # -- top-level orchestration -----------------------------------------------------
 
 
@@ -313,12 +420,20 @@ def run_install(
     *,
     dry_run: bool = False,
     uninstall: bool = False,
+    with_hook: bool = False,
     home: Path | None = None,
     which: WhichFn | None = None,
     runner: SubprocessRunner = _default_runner,
     out: Callable[[str], None] = print,
 ) -> int:
-    """Register (or unregister) extrovert with every detected client."""
+    """Register (or unregister) extrovert with every detected client.
+
+    ``with_hook`` additionally wires a UserPromptSubmit hook running
+    ``extrovert hint`` into Claude Code's settings.json (backed up first;
+    idempotent). Kimi Code's hook format is unconfirmed, so only a suggested
+    snippet is printed there.
+    """
+    home = home or Path.home()
     launch = detect_launch_command(which)
     targets = detect_clients(home=home, which=which)
     verb = "uninstall" if uninstall else "install"
@@ -365,4 +480,26 @@ def run_install(
         out(f"  {'ok' if result.ok else 'FAILED'}: {result.message}")
         if not result.ok:
             exit_code = 1
+
+    if with_hook:
+        out("\n[hook] prompt-submit reminder")
+        claude_present = any(t.kind == "claude-cli" for t in targets)
+        kimi_present = any(t.kind.startswith("kimi") for t in targets)
+        if claude_present:
+            settings_path = home / ".claude" / "settings.json"
+            hook_result = (
+                uninstall_claude_hook(settings_path, launch, dry_run=dry_run)
+                if uninstall
+                else install_claude_hook(settings_path, launch, dry_run=dry_run)
+            )
+            for step in hook_result.planned:
+                out(f"  plan: {step}")
+            out(f"  {'ok' if hook_result.ok else 'FAILED'}: {hook_result.message}")
+            if not hook_result.ok:
+                exit_code = 1
+        if kimi_present:
+            for line in kimi_hook_snippet(launch).splitlines():
+                out(f"  {line}")
+        if not claude_present and not kimi_present:
+            out("  no known client to hook into.")
     return exit_code

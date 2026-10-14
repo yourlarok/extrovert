@@ -286,6 +286,7 @@ def test_doctor_all_green(tmp_path: Path) -> None:
     code = doctor.run_doctor(
         which=fake_which({"npx": "/usr/bin/npx", "uvx": "/usr/bin/uvx"}),
         registry_probe=lambda: (True, "registry responded"),
+        hint_probe=lambda: (True, "hint works"),
         state_home=tmp_path / "state",
         out=lambda s: None,
     )
@@ -297,6 +298,7 @@ def test_doctor_offline_registry_is_warning_not_failure(tmp_path: Path) -> None:
     code = doctor.run_doctor(
         which=fake_which({}),
         registry_probe=lambda: (False, "boom"),
+        hint_probe=lambda: (True, "ok"),
         state_home=tmp_path / "state",
         out=lines.append,
     )
@@ -312,6 +314,7 @@ def test_doctor_unwritable_state_dir_fails(tmp_path: Path) -> None:
     code = doctor.run_doctor(
         which=fake_which({}),
         registry_probe=lambda: (True, "ok"),
+        hint_probe=lambda: (True, "ok"),
         state_home=blocker,
         out=lines.append,
     )
@@ -334,10 +337,15 @@ def test_cli_parser_subcommands() -> None:
     assert args.subcommand == "install" and args.dry_run
     assert parser.parse_args(["uninstall", "-y"]).yes
     assert parser.parse_args(["doctor"]).subcommand == "doctor"
+    assert parser.parse_args(["hint"]).subcommand == "hint"
+    assert parser.parse_args(["install", "--with-hook"]).with_hook
+    assert parser.parse_args(["uninstall", "--with-hook"]).with_hook
+    assert not parser.parse_args(["install"]).with_hook
 
 
 def test_cli_doctor_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor, "probe_registry", lambda: (True, "ok"))
+    monkeypatch.setattr(doctor, "probe_hint", lambda: (True, "ok"))
     monkeypatch.setenv("EXTROVERT_HOME", str(tmp_path / "state"))
     with pytest.raises(SystemExit) as exc:
         main(["doctor"])
@@ -367,14 +375,181 @@ def test_skill_md_frontmatter() -> None:
         fields[key.strip()] = value.strip()
     assert fields["name"] == "extrovert"
     description = fields["description"]
-    assert "capability" in description
-    assert "触发词" in description
-    # trigger words promised in the description
-    for word in ("装个", "找", "缺工具"):
-        assert word in description
+    # situation-driven: the description describes task contexts, not user passwords
+    assert "规划" in description
+    assert "通用外部能力" in description
+    assert "capability_consider" in description
+    assert "无需用户明确要求" in description
     body = text.split("---\n", 2)[2]
-    for tool in ("capability_search", "capability_add", "capability_verify", "capability_list", "capability_remove"):
+    for tool in (
+        "capability_consider",
+        "capability_search",
+        "capability_add",
+        "capability_verify",
+        "capability_list",
+        "capability_remove",
+    ):
         assert tool in body
+    # planning checklist, honesty constraint, anti-patterns
+    assert "规划期自检清单" in body
+    assert "已确认无现成能力" in body
+    assert "反模式" in body
+
+
+# -- extrovert hint ----------------------------------------------------------------
+
+
+def test_hint_text_single_line() -> None:
+    from extrovert.hint import HINT_TEXT
+
+    assert "\n" not in HINT_TEXT
+    assert "capability_consider" in HINT_TEXT
+    assert len(HINT_TEXT) < 120
+
+
+def test_cli_hint(capsys) -> None:
+    from extrovert.hint import HINT_TEXT
+
+    with pytest.raises(SystemExit) as exc:
+        main(["hint"])
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == HINT_TEXT
+
+
+# -- claude UserPromptSubmit hook ----------------------------------------------------
+
+
+def test_install_claude_hook_creates_settings(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    result = install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert result.ok and result.changed
+    data = json.loads(settings.read_text())
+    entries = data["hooks"]["UserPromptSubmit"]
+    assert entries == [{"hooks": [{"type": "command", "command": "/usr/local/bin/extrovert hint"}]}]
+    # no backup when the file did not exist
+    assert not settings.with_name("settings.json.bak").exists()
+
+
+def test_install_claude_hook_preserves_existing_and_is_idempotent(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "model": "opus",
+                "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "other-tool hint"}]}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert result.ok and result.changed
+    data = json.loads(settings.read_text())
+    assert data["model"] == "opus"
+    commands = [
+        h["command"]
+        for entry in data["hooks"]["UserPromptSubmit"]
+        for h in entry["hooks"]
+    ]
+    assert commands == ["other-tool hint", "/usr/local/bin/extrovert hint"]
+    backup = settings.with_name("settings.json.bak")
+    assert backup.exists()
+    assert "extrovert" not in backup.read_text()
+
+    again = install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert again.ok and not again.changed
+
+
+def test_install_claude_hook_dry_run_and_invalid_json(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{broken", encoding="utf-8")
+    result = install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert not result.ok and not result.changed
+    assert "manually" in result.message
+
+    settings.write_text("{}", encoding="utf-8")
+    dry = install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=True)
+    assert dry.ok and not dry.changed
+    assert json.loads(settings.read_text()) == {}  # untouched
+
+
+def test_uninstall_claude_hook(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"env": {"A": "1"}}), encoding="utf-8")
+    install.install_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    result = install.uninstall_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert result.ok and result.changed
+    data = json.loads(settings.read_text())
+    assert data == {"env": {"A": "1"}}  # empty hooks structures pruned
+
+    again = install.uninstall_claude_hook(settings, FAKE_LAUNCH, dry_run=False)
+    assert again.ok and not again.changed
+
+
+def test_run_install_with_hook_writes_claude_settings(tmp_path: Path) -> None:
+    record: list[list[str]] = []
+    outputs = iter(["", "extrovert: ..."])
+
+    def runner(cmd, **kwargs):
+        record.append(list(cmd))
+        out = subprocess.CompletedProcess(cmd, 0, "", "")
+        if "list" in cmd:
+            out.stdout = next(outputs)
+        return out
+
+    lines: list[str] = []
+    code = install.run_install(
+        dry_run=False,
+        with_hook=True,
+        home=tmp_path,
+        which=fake_which({"claude": "/opt/claude", "extrovert": "/usr/local/bin/extrovert"}),
+        runner=runner,
+        out=lines.append,
+    )
+    assert code == 0
+    settings = tmp_path / ".claude" / "settings.json"
+    data = json.loads(settings.read_text())
+    assert data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "/usr/local/bin/extrovert hint"
+    text = "\n".join(lines)
+    assert "[hook]" in text
+
+
+def test_run_install_with_hook_kimi_prints_snippet(tmp_path: Path) -> None:
+    kimi = tmp_path / ".kimi-code"
+    kimi.mkdir()
+    (kimi / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    lines: list[str] = []
+    code = install.run_install(
+        dry_run=False,
+        with_hook=True,
+        home=tmp_path,
+        which=fake_which({"extrovert": "/usr/local/bin/extrovert"}),
+        out=lines.append,
+    )
+    assert code == 0
+    text = "\n".join(lines)
+    assert "hook 配置格式未确认" in text
+    assert "/usr/local/bin/extrovert hint" in text
+    assert not (tmp_path / ".claude").exists()  # no claude -> no settings written
+
+
+# -- doctor hint check -----------------------------------------------------------------
+
+
+def test_doctor_hint_check_optional_failure(tmp_path: Path) -> None:
+    lines: list[str] = []
+    code = doctor.run_doctor(
+        which=fake_which({}),
+        registry_probe=lambda: (True, "ok"),
+        hint_probe=lambda: (False, "hint broken"),
+        state_home=tmp_path / "state",
+        out=lines.append,
+    )
+    assert code == 0  # hint is optional
+    text = "\n".join(lines)
+    assert "hint-command" in text and "hint broken" in text
 
 
 def test_install_md_magic_prompt() -> None:

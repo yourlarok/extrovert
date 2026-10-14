@@ -28,12 +28,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_install = sub.add_parser("install", help="register extrovert into detected agent clients")
     p_install.add_argument("--dry-run", action="store_true", help="print the plan; change nothing")
     p_install.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    p_install.add_argument(
+        "--with-hook",
+        action="store_true",
+        help="also wire a UserPromptSubmit hook ('extrovert hint') into Claude Code's settings.json",
+    )
 
     p_uninstall = sub.add_parser("uninstall", help="remove extrovert from detected agent clients")
     p_uninstall.add_argument("--dry-run", action="store_true", help="print the plan; change nothing")
     p_uninstall.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    p_uninstall.add_argument(
+        "--with-hook",
+        action="store_true",
+        help="also remove the UserPromptSubmit hook from Claude Code's settings.json",
+    )
 
     sub.add_parser("doctor", help="self-check the environment and print a report")
+    sub.add_parser("hint", help="print a one-line planning reminder (for prompt-submit hooks)")
     return parser
 
 
@@ -56,17 +67,22 @@ def main(argv: list[str] | None = None) -> None:
 
         raise SystemExit(run_doctor())
 
+    if args.subcommand == "hint":
+        from .hint import main as hint_main
+
+        raise SystemExit(hint_main())
+
     from .install import run_install
 
     uninstall = args.subcommand == "uninstall"
     if args.dry_run:
-        raise SystemExit(run_install(dry_run=True, uninstall=uninstall))
+        raise SystemExit(run_install(dry_run=True, uninstall=uninstall, with_hook=args.with_hook))
     if not args.yes and sys.stdin.isatty():
         action = "remove extrovert from" if uninstall else "register extrovert into"
         if not _confirm(f"This will {action} detected agent client configs. Proceed?"):
             print("aborted; nothing changed.")
             raise SystemExit(0)
-    raise SystemExit(run_install(dry_run=False, uninstall=uninstall))
+    raise SystemExit(run_install(dry_run=False, uninstall=uninstall, with_hook=args.with_hook))
 
 
 if __name__ == "__main__":

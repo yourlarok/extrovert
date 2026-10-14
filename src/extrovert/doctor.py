@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -11,9 +12,11 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
+from .hint import HINT_TEXT
 from .registry import registry_base_url
 
 REGISTRY_PROBE_TIMEOUT = 3.0
+HINT_PROBE_TIMEOUT = 5.0
 
 
 @dataclass
@@ -36,6 +39,21 @@ def probe_registry(timeout: float = REGISTRY_PROBE_TIMEOUT) -> tuple[bool, str]:
     return True, f"{registry_base_url()} responded"
 
 
+def probe_hint() -> tuple[bool, str]:
+    """Run the resolved launch command with the hint subcommand."""
+    from .install import detect_launch_command
+
+    launch = detect_launch_command()
+    cmd = [*launch.argv, "hint"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=HINT_PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"'{launch.display} hint' failed to run: {exc}"
+    if proc.returncode != 0 or HINT_TEXT not in proc.stdout:
+        return False, f"'{launch.display} hint' exited {proc.returncode}: {(proc.stderr or '').strip()[:120]}"
+    return True, f"'{launch.display} hint' works"
+
+
 def check_state_dir(home: Path) -> tuple[bool, str]:
     try:
         home.mkdir(parents=True, exist_ok=True)
@@ -50,11 +68,13 @@ def run_checks(
     *,
     which: Callable[[str], str | None] = shutil.which,
     registry_probe: Callable[[], tuple[bool, str]] | None = None,
+    hint_probe: Callable[[], tuple[bool, str]] | None = None,
     state_home: Path | None = None,
 ) -> list[Check]:
     from .config import extrovert_home
 
     probe = registry_probe or probe_registry
+    hint = hint_probe or probe_hint
 
     checks: list[Check] = []
 
@@ -99,6 +119,9 @@ def run_checks(
     reachable, detail = probe()
     checks.append(Check("registry", reachable, detail, critical=False))
 
+    hint_ok, hint_detail = hint()
+    checks.append(Check("hint-command", hint_ok, hint_detail, critical=False))
+
     home = state_home or extrovert_home()
     writable, detail = check_state_dir(home)
     checks.append(Check("state-dir", writable, detail))
@@ -130,9 +153,12 @@ def run_doctor(
     *,
     which: Callable[[str], str | None] = shutil.which,
     registry_probe: Callable[[], tuple[bool, str]] | None = None,
+    hint_probe: Callable[[], tuple[bool, str]] | None = None,
     state_home: Path | None = None,
     out: Callable[[str], None] = print,
 ) -> int:
-    checks = run_checks(which=which, registry_probe=registry_probe, state_home=state_home)
+    checks = run_checks(
+        which=which, registry_probe=registry_probe, hint_probe=hint_probe, state_home=state_home
+    )
     out(render_report(checks))
     return 1 if any(not c.ok and c.critical for c in checks) else 0

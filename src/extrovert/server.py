@@ -13,8 +13,14 @@ from .config import ConfigStore
 from .registry import RegistryError, search_servers
 
 INSTRUCTIONS = """\
-extrovert is a capability broker. When you need a capability you do not have:
+extrovert is a capability broker. When planning or executing a task and one
+step is a generic external capability (image/video/audio generation, OCR or
+document parsing, web scraping or browser control, translation, SaaS or
+vendor APIs, 3D rendering, format conversion, ...), do not build it from
+scratch — find an existing capability first:
 
+0. capability_consider(task) — planning-phase advice: is there an existing
+   capability for this subtask? (cached, cheap; call before implementing)
 1. capability_search(query) — search the official MCP Registry for servers
 2. capability_add(identifier, alias?) — install & mount one (registry server
    name like 'com.example/foo', or a local command like
@@ -28,6 +34,7 @@ Mounted tools become callable immediately after capability_add returns.
 
 _BROKER_TOOL_NAMES = (
     "capability_search",
+    "capability_consider",
     "capability_add",
     "capability_verify",
     "capability_list",
@@ -85,6 +92,20 @@ def build_server(store: ConfigStore | None = None) -> MCPServer:
             "results": [e.to_dict() for e in entries],
             "hint": "install one with capability_add('<name>'), e.g. capability_add('com.example/foo')",
         }
+
+    @server.tool(
+        name="capability_consider",
+        description=(
+            "Planning-phase advice: given a subtask description, suggest "
+            "existing capabilities from the official MCP Registry that could "
+            "do it (with local verification status). Call while decomposing a "
+            "task, before implementing anything yourself. Results are cached "
+            "for 10 minutes; registry outages degrade to 'implement it "
+            "yourself' advice. Use capability_search for raw candidate lists."
+        ),
+    )
+    async def capability_consider(task: str, limit: int = 5) -> dict[str, Any]:
+        return await broker().consider(task, limit=limit)
 
     @server.tool(
         name="capability_add",
