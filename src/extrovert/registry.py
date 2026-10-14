@@ -151,13 +151,13 @@ def parse_server_list(payload: dict[str, Any]) -> list[ServerEntry]:
     return entries
 
 
-def _http_json(url: str) -> dict[str, Any]:
+def _http_json(url: str, timeout: float = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": f"extrovert-mcp/{__version__}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS, context=_ssl_context()) as resp:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as resp:
             body = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 404:

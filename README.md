@@ -4,6 +4,12 @@
 
 Make your "introverted" AI agent extroverted: a local MCP capability broker. Configure extrovert once, and the agent can search the [official MCP Registry](https://registry.modelcontextprotocol.io), install third-party MCP servers, smoke-verify them, and **hot-mount** their tools at runtime — no user intervention, no restarts.
 
+## 30 秒安装 / 30-second install
+
+不用手动编辑任何配置：把 [INSTALL.md](INSTALL.md) 里的魔法提示词粘贴给任意 agent，它会自己执行 `pip install` → `extrovert doctor` → `extrovert install` 完成注册，然后让你重启会话。
+
+No manual config editing: paste the magic prompt from [INSTALL.md](INSTALL.md) into any agent; it runs `pip install` → `extrovert doctor` → `extrovert install` itself, then asks you to restart the session.
+
 ## 架构 / Architecture
 
 ```
@@ -38,12 +44,26 @@ pip install -e .
 
 要求 Python ≥ 3.10。注册表里的 npm 服务器需要 `npx`；pypi 服务器优先用 `uvx`（未安装则回退 `python3 -m`，需该包已安装）。
 
+### CLI 子命令 / CLI subcommands
+
+裸 `extrovert`（或 `extrovert serve`）运行 MCP 代理服务器；其余子命令用于安装与诊断：
+
+- `extrovert doctor` — 自检：Python/mcp SDK 版本、`npx`/`uvx` 可用性、注册表连通性（3s 超时）、`~/.extrovert` 可写性；关键项失败时退出码为 1
+- `extrovert install` — 检测本机客户端并注册 extrovert：有 `claude` CLI 就走 `claude mcp add -s user extrovert -- <启动命令>` 并用 `claude mcp list` 验证；Kimi Code 优先写 `~/.kimi-code/mcp.json` 的 `mcpServers`，或向已含 `[mcp_servers]` 段的 `config.toml` 追加条目（均先备份为 `.bak`）；格式不确定时**不猜**，打印片段让你手动粘贴。`--dry-run` 只看计划，`--yes` 跳过确认
+- `extrovert uninstall` — 反向移除
+
+### Skill 触发包 / Skill pack
+
+仓库自带 `skills/extrovert/SKILL.md`，让 agent 在听到"装个 XX 能力""找个 XX 工具"时可靠地走 search → add → verify → 调用流程（含失败必须如实报告等约束）。安装方式：软链或复制到 agent 的技能目录，例如 `ln -s $PWD/skills/extrovert ~/.agents/skills/extrovert`。
+
+The repo ships `skills/extrovert/SKILL.md` so agents reliably route capability requests through extrovert. Symlink or copy it into your agent's skills directory, e.g. `~/.agents/skills/extrovert`.
+
 ## 客户端配置 / Client configuration
 
 **Claude Code**
 
 ```bash
-claude mcp add extrovert -- extrovert
+claude mcp add -s user extrovert -- extrovert
 ```
 
 或写入 `~/.claude.json` / 项目 `.mcp.json`：
